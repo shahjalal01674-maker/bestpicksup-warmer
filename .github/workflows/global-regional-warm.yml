@@ -1,0 +1,42 @@
+name: Global Regional Cache Warmer
+
+# Budget (at up to 500 sitemap URLs, ~1.5 min avg per job):
+#   4 cron firings/day × 3 matrix jobs × 1.5 min = 18 min/day = ~540 min/month
+#   Combined with warm-edge-cache.yml (1,350 min/month) = 1,890 min/month
+#   GitHub Actions private free tier limit: 2,000 min/month → 110 min buffer.
+
+on:
+  schedule:
+    # Every 6 hours = 4 firings/day. Each firing spawns 3 matrix jobs.
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  warm-regions:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        region: [US, UK, CA]
+    steps:
+      - name: Trigger Regional Warming
+        run: |
+          SITE="https://bestpicksup.com"
+          echo "Warming ${{ matrix.region }} region..."
+
+          # Fetch sitemap and extract all URLs
+          URLS=$(curl -s "$SITE/sitemap.xml" | grep -oP '(?<=<loc>)[^<]+(?=</loc>)')
+
+          # One fetch per URL is enough to populate caches.default + KV.
+          # The 5-attempt loop + sleep 0.5 was redundant work — after the
+          # first hit lands MISS-STORED, subsequent hits just re-read the
+          # same warmed entry. Removing them cuts per-job time ~5x at
+          # 500-URL scale, keeping each matrix job billed at 1-2 min.
+          for URL in $URLS; do
+            curl -s -o /dev/null \
+                 -w "%{http_code} - %{time_total}s - $URL\n" \
+                 -H "X-Region-Target: ${{ matrix.region }}" \
+                 -H "User-Agent: GlobalRegionalWarmer/1.0" \
+                 -H "Accept-Encoding: gzip, br" \
+                 --max-time 15 \
+                 "$URL"
+          done

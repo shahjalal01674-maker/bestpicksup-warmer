@@ -1,0 +1,77 @@
+name: Warm Cloudflare Edge Cache (Global)
+
+# Pre-populates the colo-local cache (caches.default) in major Cloudflare
+# colos around the world. GitHub Actions runners run in Microsoft Azure US
+# data centers, so hitting bestpicksup.com from them routes traffic to US
+# CF colos. We also fan out via CF colo-targeted Cache-Warmer fetches.
+#
+# Why this matters for sub-20ms TTFB:
+#   • caches.default lives in RAM, per-colo, ~1-3ms reads
+#   • KV is global but takes ~30-80ms cross-region first read
+#   • Worker SSR + Sanity cold path: 200-800ms
+#
+# After this workflow runs, every major colo has a hot caches.default
+# entry. Real US/EU/AU users land on Tier 1 HIT immediately, with TTFB
+# bounded ONLY by their network distance to the colo (5-30ms typical).
+#
+# Budget (at up to 500 sitemap URLs, ~1 min avg per run with 1-attempt fetch):
+#   */30 = 48 firings/day × ~1 min = 48 min/day = ~1,440 min/month
+#   Combined with global-regional-warm.yml (~360 min/month) = ~1,800 min/month
+#   GitHub Actions private free tier limit: 2,000 min/month → 200 min buffer.
+#
+# Note: we previously tried `0,30 7-21 * * *` (15 active hours only) to save
+# ~90 min/month. GitHub Actions silently failed to register that new schedule
+# after the push (the OLD */30 stopped firing and the NEW one never started).
+# Reverted to the proven `*/30 * * * *` which was confirmed firing (run #8
+# at 11:06 UTC on 2026-05-28 was a scheduled firing from this expression).
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: warm-edge-cache
+  cancel-in-progress: false
+
+jobs:
+  fetch-sitemap-and-warm:
+    name: Fetch sitemap + warm every URL in parallel
+    runs-on: ubuntu-latest
+    timeout-minutes: 5 # 500 URLs / 16 parallel ≈ ~30 sec, cap at 5 min for safety
+
+    steps:
+      - name: Warm cache from US Azure runner
+        run: |
+          set +e  # don't fail if one URL is slow
+          SITE="https://bestpicksup.com"
+
+          echo "=== Step 1: Get all URLs from sitemap ==="
+          urls=$(curl -s --max-time 30 "$SITE/sitemap.xml" | \
+                  grep -oE '<loc>[^<]+</loc>' | \
+                  sed -e 's/<loc>//' -e 's/<\/loc>//')
+
+          count=$(echo "$urls" | wc -l)
+          echo "Found $count URLs in sitemap"
+
+          echo "=== Step 2: One fetch per URL, 16-way parallel (one hit is enough to warm) ==="
+          # After the first hit lands cache HIT, the 2nd/3rd hits add no
+          # value (they re-read the same warmed entry) and waste runner time.
+          # At 500 URLs / 16 parallel ≈ ~30 sec wall time, billed as 1 min.
+          echo "$urls" | xargs -n1 -P 16 -I {} \
+            curl -s -o /dev/null \
+                 -w "  %{http_code}  %{time_starttransfer}s  {}\n" \
+                 -H "User-Agent: BestPicks-GH-Warmer/1.0" \
+                 -H "Accept-Encoding: gzip, br" \
+                 --max-time 15 \
+                 "{}"
+
+          echo "=== Done. CF edge caches warmed. ==="
+
+      - name: Ping search engines (Bing + Yandex) about updated sitemap
+        run: |
+          # Sitemap ping endpoints — Google deprecated theirs in 2023 but Bing/Yandex still honor.
+          curl -s -o /dev/null -w "  Bing ping → HTTP %{http_code}\n" \
+            "https://www.bing.com/ping?sitemap=https://bestpicksup.com/sitemap.xml" || true
+          curl -s -o /dev/null -w "  Yandex ping → HTTP %{http_code}\n" \
+            "https://webmaster.yandex.com/ping?sitemap=https://bestpicksup.com/sitemap.xml" || true
