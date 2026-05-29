@@ -1,0 +1,16 @@
+{
+  "name": "bestpicks-pinterest-agent-runner",
+  "version": "1.0.0",
+  "description": "Node renderer + R2 uploader. Runs in GitHub Actions because CF Workers Free tier 10ms CPU limit can't handle Satori + resvg image rendering. Pulls pending pins from the worker, renders 1000x1500 PNG, uploads to R2, notifies worker to publish via Pinterest API.",
+  "type": "module",
+  "main": "render.mjs",
+  "scripts": {
+    "render": "node render.mjs"
+  },
+  "dependencies": {
+    "satori": "^0.10.14",
+    "@resvg/resvg-js": "^2.6.2",
+    "@aws-sdk/client-s3": "^3.600.0",
+    "preact": "^10.29.2"
+  }
+}
