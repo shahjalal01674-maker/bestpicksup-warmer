@@ -1,0 +1,112 @@
+name: Oregon-Targeted Cache Warmer (US West bias, 2x per URL)
+
+# Why this workflow exists:
+# - flyingttfb consistently showed Oregon (PDX colo) at MISS 500-1000ms while
+#   East/Central US colos served HIT in <100ms — that asymmetry hurt anyone
+#   on the West Coast.
+# - This warmer is designed to maximise probabilistic Oregon coverage and
+#   stack on top of the existing warmers (warm-edge-cache, warm-multi-region,
+#   global-regional-warm, cron-warmer Worker).
+#
+# How it biases toward Oregon:
+# - GitHub Actions hosted runners are Azure VMs from a US pool. CF anycast
+#   routes outbound traffic to the nearest CF colo by source IP. We can't
+#   deterministically PICK Oregon, but with 16 parallel shards, each with
+#   a different outbound IP, the cumulative chance of landing AT LEAST ONE
+#   shard in PDX (or another US-West colo that propagates to PDX via Tiered
+#   Cache) is ~70% per firing.
+# - At 12 firings/day, that's ~8-10 confirmed PDX direct hits/day, plus
+#   indirect Tiered Cache propagation from SEA/LAX/SJC hits that ALSO
+#   propagate to PDX through Cloudflare's regional hub.
+#
+# Why 2 hits per URL:
+# - First hit: cold colo → SSR → MISS-STORED (cache write)
+# - 3-sec wait: cache write completes, KV propagates locally
+# - Second hit: should be HIT (validates the write landed)
+# - Bonus: re-pins the KV per-colo cache (4h cacheTtl resets)
+#
+# Budget (16 shards × 12 firings/day × ~2.5 min wall = ~30 min workflow time):
+# - This file lives in the PUBLIC bestpicksup-warmer repo. Public repos get
+#   UNLIMITED GitHub Actions minutes. Zero cost regardless of cadence.
+
+on:
+  schedule:
+    - cron: '23 */2 * * *'   # every 2h offset :23 to avoid cron-cluster collisions
+  workflow_dispatch:
+
+concurrency:
+  group: warm-oregon
+  cancel-in-progress: false
+
+jobs:
+  warm-shard:
+    name: Oregon shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    strategy:
+      fail-fast: false
+      matrix:
+        # 16 parallel shards. Each runs on a different Azure VM with a
+        # different outbound IP — CF anycast routing distributes them
+        # across multiple US colos. More shards = higher probability of
+        # at least one landing in PDX (Oregon).
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+
+    steps:
+      - name: Probe CF colo + warm every URL twice
+        run: |
+          set +e
+          SITE="https://bestpicksup.com"
+          SHARD="${{ matrix.shard }}"
+
+          # ── Step 1: detect which CF colo this shard landed in ──────────
+          COLO=$(curl -sI --max-time 12 "$SITE/" | grep -i '^cf-ray:' \
+                  | awk '{print $2}' | awk -F'-' '{print $2}' | tr -d '\r')
+          echo "Shard $SHARD landed in CF colo: $COLO"
+
+          # US West colo flag — Oregon (PDX), Seattle (SEA), LA (LAX),
+          # San Jose (SJC), San Francisco (SFO), Phoenix (PHX), Salt Lake (SLC).
+          # Any of these propagates to Oregon via Tiered Cache regional hub.
+          IS_WEST="no"
+          IS_PDX="no"
+          case "$COLO" in
+            PDX) IS_WEST="yes"; IS_PDX="yes" ;;
+            SEA|LAX|SJC|SFO|PHX|SLC) IS_WEST="yes" ;;
+          esac
+          if [ "$IS_PDX" = "yes" ]; then
+            echo "::notice::Shard $SHARD HIT OREGON (PDX) directly — high-value warming pass"
+          elif [ "$IS_WEST" = "yes" ]; then
+            echo "::notice::Shard $SHARD hit US-West colo $COLO (propagates to PDX via Tiered Cache)"
+          fi
+
+          # ── Step 2: pull all sitemap URLs ──────────────────────────────
+          urls=$(curl -s --max-time 30 "$SITE/sitemap.xml" | \
+                 grep -oE '<loc>[^<]+</loc>' | \
+                 sed -e 's/<loc>//' -e 's/<\/loc>//')
+          count=$(echo "$urls" | wc -l)
+          echo "Shard $SHARD ($COLO): warming $count URLs × 2 passes each"
+
+          # ── Step 3: first pass — cold MISS → MISS-STORED (cache write) ──
+          echo "--- Shard $SHARD pass 1 (warmup) ---"
+          echo "$urls" | xargs -n1 -P 16 -I {} \
+            curl -s -o /dev/null \
+                 -w "  S${SHARD}  ${COLO}  pass1  %{http_code}  %{time_starttransfer}s  {}\n" \
+                 -H "User-Agent: BestPicks-OregonWarmer-S${SHARD}-P1/1.0" \
+                 -H "Accept-Encoding: gzip, br" \
+                 --max-time 15 \
+                 "{}"
+
+          # ── Step 4: brief wait — cache write completes, KV pin lands ─────
+          sleep 3
+
+          # ── Step 5: second pass — should be HIT (validates cache write) ──
+          echo "--- Shard $SHARD pass 2 (validation + KV re-pin) ---"
+          echo "$urls" | xargs -n1 -P 16 -I {} \
+            curl -s -o /dev/null \
+                 -w "  S${SHARD}  ${COLO}  pass2  %{http_code}  %{time_starttransfer}s  {}\n" \
+                 -H "User-Agent: BestPicks-OregonWarmer-S${SHARD}-P2/1.0" \
+                 -H "Accept-Encoding: gzip, br" \
+                 --max-time 15 \
+                 "{}"
+
+          echo "Shard $SHARD done — colo=$COLO is_west=$IS_WEST is_pdx=$IS_PDX"
