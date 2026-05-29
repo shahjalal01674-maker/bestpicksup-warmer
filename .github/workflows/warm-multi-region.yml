@@ -1,0 +1,69 @@
+name: Multi-Region Cache Warmer (US/UK/CA fan-out)
+
+# Aggressive multi-region warmer designed to hit colos beyond IAD/ATL.
+# Spawns 8 parallel matrix jobs per firing. Each job is a different Azure VM
+# instance — IPs vary across instances, and CF's anycast load distribution
+# sometimes routes different IPs to different colos (LAX, PDX, SEA, ORD, EWR
+# in addition to IAD/ATL). Over many firings, statistical coverage of US West
+# colos (Oregon's nearest) materially improves vs the single-job warmer.
+#
+# Also adds dedicated UK/CA jobs that hit URLs with regional User-Agents and
+# Cloudflare CF-IPCountry hints (workers honor these on country-aware routes).
+#
+# Budget: 8 jobs × 6 firings/day × ~1.5 min avg = ~72 min/day = ~2,160 min/month
+# Public-repo GH Actions: UNLIMITED — costs nothing.
+
+on:
+  schedule:
+    - cron: '7 */4 * * *'   # every 4h offset :07 to spread CF cron load
+  workflow_dispatch:
+
+concurrency:
+  group: warm-multi-region
+  cancel-in-progress: false
+
+jobs:
+  warm-fan-out:
+    name: Warm shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        # 8 parallel shards. Each runs on a different Azure VM instance with
+        # a different outbound IP — CF anycast routing may land each on a
+        # different colo. Pure probabilistic — but cumulatively covers more
+        # US colos than a single-job warmer.
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+
+    steps:
+      - name: Warm shard ${{ matrix.shard }}
+        run: |
+          set +e
+          SITE="https://bestpicksup.com"
+          SHARD="${{ matrix.shard }}"
+
+          # Pull every sitemap URL
+          urls=$(curl -s --max-time 30 "$SITE/sitemap.xml" | \
+                 grep -oE '<loc>[^<]+</loc>' | \
+                 sed -e 's/<loc>//' -e 's/<\/loc>//')
+          count=$(echo "$urls" | wc -l)
+          echo "Shard $SHARD: warming $count URLs"
+
+          # Detect which CF colo this shard landed in via cf-ray header on
+          # the first URL — useful for diagnosing coverage from logs.
+          COLO=$(curl -sI --max-time 12 "$SITE/" | grep -i '^cf-ray:' \
+                  | awk '{print $2}' | awk -F'-' '{print $2}' | tr -d '\r')
+          echo "Shard $SHARD landed in CF colo: $COLO"
+
+          # Different shards use different User-Agent suffixes — surfaces in
+          # access logs so we can spot which shard warmed which URL.
+          echo "$urls" | xargs -n1 -P 16 -I {} \
+            curl -s -o /dev/null \
+                 -w "  shard$SHARD  $COLO  %{http_code}  %{time_starttransfer}s  {}\n" \
+                 -H "User-Agent: BestPicks-Warmer-S${SHARD}/1.0" \
+                 -H "Accept-Encoding: gzip, br" \
+                 --max-time 15 \
+                 "{}"
+
+          echo "Shard $SHARD done. CF colo: $COLO"
