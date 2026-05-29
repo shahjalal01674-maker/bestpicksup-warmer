@@ -114,6 +114,15 @@ function productHighlight(req, theme, productImageUrl) {
   const price = formatPrice(source.price);
   const brand = source.brand ?? source.category?.title ?? 'BestPicks';
 
+  // Adaptive headline size — shrinks for longer text so it never overflows
+  // into the product card. Cuts in at ~22/30/40 chars (Pinterest tests
+  // showed real headlines cluster around 4 buckets).
+  const headlineLen = (copy.headline || '').length;
+  const headlineFontSize = headlineLen > 40 ? 80
+                         : headlineLen > 30 ? 100
+                         : headlineLen > 22 ? 120
+                         : SIZE.hero;
+
   return el('div', { style: {
     width: CANVAS.width, height: CANVAS.height,
     display: 'flex', flexDirection: 'column',
@@ -125,17 +134,17 @@ function productHighlight(req, theme, productImageUrl) {
       ...badgeStyle(theme.badgeStyle, t),
     }}, `REVIEW · ${new Date().getFullYear()}`),
 
-    // Headline
+    // Headline — adaptive height for short vs long headlines.
     el('div', { style: {
       display: 'flex', flexDirection: 'column',
-      paddingTop: CANVAS.safeTop + 80,
+      paddingTop: CANVAS.safeTop + 60,
       paddingLeft: CANVAS.safeSide, paddingRight: CANVAS.safeSide + 220,
-      height: 460,
+      height: headlineLen > 30 ? 420 : 460,
     }}, [
       el('div', { style: {
         fontFamily: TYPE.headline.fontFamily, fontWeight: TYPE.headline.fontWeight,
         letterSpacing: '-0.01em', lineHeight: 0.95,
-        fontSize: SIZE.hero, color: t.fg, textTransform: 'uppercase',
+        fontSize: headlineFontSize, color: t.fg, textTransform: 'uppercase',
       }}, copy.headline),
     ]),
 
